@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 )
 
 // ConfigReader reads config
@@ -24,6 +25,10 @@ type ConfigNotifier interface {
 	ConfigReader
 }
 
+// ConfigChanged is a callback that is being called when
+// the config changes
+type ConfigChanged func(cfg interface{})
+
 // Operator is responsible to coordinate readers, writers & notifiers
 type Operator struct {
 	config interface{}
@@ -31,6 +36,9 @@ type Operator struct {
 	readers   []ConfigReader
 	writers   []ConfigWriter
 	notifiers []ConfigNotifier
+
+	observers    []ConfigChanged
+	mtxObservers sync.RWMutex
 }
 
 // ConfigOption cinfigure the operator
@@ -65,6 +73,7 @@ func NewOperator(config interface{}, opts ...ConfigOption) *Operator {
 		readers:   make([]ConfigReader, 0),
 		writers:   make([]ConfigWriter, 0),
 		notifiers: make([]ConfigNotifier, 0),
+		observers: make([]ConfigChanged, 0),
 	}
 
 	for _, opt := range opts {
@@ -75,18 +84,19 @@ func NewOperator(config interface{}, opts ...ConfigOption) *Operator {
 }
 
 // ConfigChanged is being called by notifiers
-func (o Operator) ConfigChanged(cr ConfigReader) {
+func (o *Operator) ConfigChanged(cr ConfigReader) {
 	if err := cr.Read(o.config); err != nil {
 		log.Printf("failed to read config: %s", err)
 	}
 	if err := o.write(o.config); err != nil {
 		log.Printf("failed to write config: %s", err)
 	}
+	o.notifyObservers()
 	data, _ := json.Marshal(o.config)
 	log.Printf("config changed: %s", string(data))
 }
 
-func (o Operator) read(config interface{}) error {
+func (o *Operator) read(config interface{}) error {
 	for _, reader := range o.readers {
 		if err := reader.Read(config); err != nil {
 			return fmt.Errorf("config read failed: %w", err)
@@ -95,7 +105,7 @@ func (o Operator) read(config interface{}) error {
 	return nil
 }
 
-func (o Operator) write(config interface{}) error {
+func (o *Operator) write(config interface{}) error {
 	for _, writer := range o.writers {
 		if err := writer.Write(config); err != nil {
 			return fmt.Errorf("config write failed: %w", err)
@@ -104,7 +114,7 @@ func (o Operator) write(config interface{}) error {
 	return nil
 }
 
-func (o Operator) startWatchers(ctx context.Context) error {
+func (o *Operator) startWatchers(ctx context.Context) error {
 	for _, notifier := range o.notifiers {
 		if err := notifier.Watch(ctx); err != nil {
 			return fmt.Errorf("failed to start notifier: %w", err)
@@ -113,11 +123,27 @@ func (o Operator) startWatchers(ctx context.Context) error {
 	return nil
 }
 
+func (o *Operator) notifyObservers() {
+	o.mtxObservers.RLock()
+	for _, observer := range o.observers {
+		observer(o.config)
+	}
+	o.mtxObservers.RUnlock()
+}
+
+// Register a ConfigChanged observer
+// It will be called when config will change
+func (o *Operator) Register(observer ConfigChanged) {
+	o.mtxObservers.Lock()
+	o.observers = append(o.observers, observer)
+	o.mtxObservers.Unlock()
+}
+
 // Process
 // - read config from readers
 // - write config to writers
 // - start watchers
-func (o Operator) Process(ctx context.Context) error {
+func (o *Operator) Process(ctx context.Context) error {
 	if err := o.read(o.config); err != nil {
 		return err
 	}
